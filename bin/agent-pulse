@@ -212,6 +212,130 @@ cmd_list() {
   render "$filter"
 }
 
+# ─── show: drill-down on one agent ────────────────────────────────────────
+cmd_show() {
+  local id="${1:-}"
+  [ -z "$id" ] && { echo "usage: agent-pulse show <id>" >&2; return 1; }
+  local mf="$REGISTRY/${id}.json"
+  [ -f "$mf" ] || { echo "no manifest for '$id' at $mf" >&2; return 1; }
+
+  local epoch_now=$(date +%s)
+  local label project kind model started pid pidfile log_file brief worktree
+  label=$(python3 -c "import json;print(json.load(open('$mf')).get('label',''))" 2>/dev/null)
+  project=$(python3 -c "import json;print(json.load(open('$mf')).get('project',''))" 2>/dev/null)
+  kind=$(python3 -c "import json;print(json.load(open('$mf')).get('kind','?'))" 2>/dev/null)
+  model=$(python3 -c "import json;print(json.load(open('$mf')).get('model','?'))" 2>/dev/null)
+  started=$(python3 -c "import json;print(json.load(open('$mf')).get('started_at',0))" 2>/dev/null)
+  pid=$(python3 -c "import json;print(json.load(open('$mf')).get('pid',''))" 2>/dev/null)
+  pidfile=$(python3 -c "import json;print(json.load(open('$mf')).get('pid_file',''))" 2>/dev/null)
+  log_file=$(python3 -c "import json;print(json.load(open('$mf')).get('log_file',''))" 2>/dev/null)
+  brief=$(python3 -c "import json;print(json.load(open('$mf')).get('brief',''))" 2>/dev/null)
+  worktree=$(python3 -c "import json;print(json.load(open('$mf')).get('worktree',''))" 2>/dev/null)
+
+  local state="${D}done${R}"
+  ps -p "$pid" -o pid= >/dev/null 2>&1 && state="${GRN}running${R}"
+
+  local elapsed=$(fmt_elapsed $((epoch_now - started)))
+  local size_kb=0
+  [ -f "$log_file" ] && size_kb=$(( $(wc -c < "$log_file") / 1024 ))
+  local tokens="-"
+  [ -f "$log_file" ] && tokens=$(grep -oE "tokens used [0-9,]+" "$log_file" 2>/dev/null | tail -1 | awk '{print $NF}')
+  [ -z "$tokens" ] && tokens="-"
+
+  printf "${B}${CYN}agent: $id${R}\n"
+  printf "${D}──────────────────────────────────────────────${R}\n"
+  printf "  %-10s %s\n" "project"  "$project"
+  printf "  %-10s %s\n" "label"    "$label"
+  printf "  %-10s ${B}%s${R}\n" "state" "$state"
+  printf "  %-10s %s  (%s)\n" "kind" "$kind" "$model"
+  printf "  %-10s %s\n" "elapsed"  "$elapsed"
+  printf "  %-10s %s tokens\n" "tokens"  "$tokens"
+  printf "  %-10s %dKB\n" "log size" "$size_kb"
+  printf "  %-10s %s\n" "pid" "${pid:-—}"
+  [ -n "$worktree" ] && printf "  %-10s %s\n" "worktree" "$worktree"
+  [ -n "$brief"    ] && printf "  %-10s %s\n" "brief"    "$brief"
+  [ -n "$log_file" ] && printf "  %-10s %s\n" "log"      "$log_file"
+
+  if [ -f "$log_file" ]; then
+    printf "\n${B}last 20 lines${R}\n"
+    printf "${D}──────────────────────────────────────────────${R}\n"
+    tail -20 "$log_file" | sed 's/\x1b\[[0-9;]*m//g'
+  fi
+}
+
+# ─── tail: live-follow an agent's log ─────────────────────────────────────
+cmd_tail() {
+  local id="${1:-}"
+  [ -z "$id" ] && { echo "usage: agent-pulse tail <id>" >&2; return 1; }
+  local mf="$REGISTRY/${id}.json"
+  [ -f "$mf" ] || { echo "no manifest for '$id'" >&2; return 1; }
+  local log_file=$(python3 -c "import json;print(json.load(open('$mf')).get('log_file',''))" 2>/dev/null)
+  [ -z "$log_file" ] || [ ! -f "$log_file" ] && { echo "no log file for '$id'" >&2; return 1; }
+  printf "${D}tailing $log_file   (Ctrl-C to exit)${R}\n\n"
+  tail -F "$log_file"
+}
+
+# ─── cleanup: remove stale manifests + pid/log pairs ──────────────────────
+cmd_cleanup() {
+  local apply=0 ttl_hours=24
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --older-than) ttl_hours="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local now=$(date +%s)
+  local cutoff=$((now - ttl_hours * 3600))
+  local removed=0 kept=0
+
+  if [ "$apply" = "0" ]; then
+    printf "${YLW}DRY-RUN${R}  (use --apply to actually delete)\n\n"
+  fi
+
+  shopt -s nullglob
+  for mf in "$REGISTRY"/*.json; do
+    local id started pid pidfile log_file alive=0
+    id=$(python3 -c "import json;print(json.load(open('$mf')).get('id',''))" 2>/dev/null)
+    started=$(python3 -c "import json;print(json.load(open('$mf')).get('started_at',0))" 2>/dev/null)
+    pid=$(python3 -c "import json;print(json.load(open('$mf')).get('pid',''))" 2>/dev/null)
+    pidfile=$(python3 -c "import json;print(json.load(open('$mf')).get('pid_file',''))" 2>/dev/null)
+    log_file=$(python3 -c "import json;print(json.load(open('$mf')).get('log_file',''))" 2>/dev/null)
+    [ -n "$pid" ] && ps -p "$pid" -o pid= >/dev/null 2>&1 && alive=1
+
+    # skip running agents
+    if [ "$alive" = "1" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    # skip recent done agents (within ttl)
+    if [ "$started" -ge "$cutoff" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+
+    # archive + remove
+    local age_hours=$(( (now - started) / 3600 ))
+    printf "  ${D}•${R} %-20s  done %dh ago\n" "$id" "$age_hours"
+    if [ "$apply" = "1" ]; then
+      mkdir -p "$AGENT_PULSE_HOME/done"
+      mv "$mf" "$AGENT_PULSE_HOME/done/${id}.json" 2>/dev/null
+      rm -f "$pidfile" 2>/dev/null
+      # keep logs — lightweight evidence for later
+    fi
+    removed=$((removed + 1))
+  done
+  shopt -u nullglob
+
+  printf "\n"
+  if [ "$apply" = "1" ]; then
+    printf "${GRN}archived: $removed   kept: $kept${R}\n"
+  else
+    printf "${YLW}would archive: $removed   would keep: $kept${R}\n"
+  fi
+}
+
 # ─── stop daemon ──────────────────────────────────────────────────────────
 cmd_stop() {
   local any=0
@@ -294,8 +418,11 @@ sub="${1:-help}"
 shift || true
 case "$sub" in
   daemon)    cmd_daemon "$@" ;;
-  watch)     cmd_watch ;;
-  list)      cmd_list ;;
+  watch)     cmd_watch "$@" ;;
+  list)      cmd_list "$@" ;;
+  show)      cmd_show "$@" ;;
+  tail)      cmd_tail "$@" ;;
+  cleanup)   cmd_cleanup "$@" ;;
   stop)      cmd_stop ;;
   dispatch)  cmd_dispatch "$@" ;;
   help|--help|-h|"")
@@ -309,6 +436,10 @@ SUBCOMMANDS
   daemon [--project N]   start the background renderer (optionally filtered)
   watch [--project N]    clear+cat loop (Ctrl-C to quit)
   list [--project N]     one-shot panel to stdout
+  show <id>              drill-down: metadata + last 20 log lines
+  tail <id>              tail -F the agent's log
+  cleanup [--apply]      archive done manifests older than 24h
+                         [--older-than H] change the age threshold
   stop                   stop the daemon(s)
   dispatch --id <name> --label <text> --project <name> \\
            [--model gpt-5.4|opus|...] [--kind codex|opus|...] \\

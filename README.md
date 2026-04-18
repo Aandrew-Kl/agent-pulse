@@ -96,10 +96,13 @@ Override via `export AGENT_PULSE_HOME=/path/to/whatever` — useful if you're ru
 
 | subcommand | effect |
 |---|---|
-| `agent-pulse daemon` | loop-render the panel into `live.txt` every 2s (backgrounded with `&`) |
-| `agent-pulse watch` | clear+cat loop against `live.txt` — what the user stares at |
-| `agent-pulse list` | one-shot render to stdout (for pipes / scripts) |
-| `agent-pulse stop` | stop the daemon |
+| `agent-pulse daemon [--project N]` | loop-render the panel into `live.txt` every 2s (backgrounded with `&`) |
+| `agent-pulse watch [--project N]` | clear+cat loop against `live.txt` — what the user stares at |
+| `agent-pulse list [--project N]` | one-shot render to stdout (for pipes / scripts) |
+| `agent-pulse show <id>` | drill-down: metadata + last 20 log lines for a single agent |
+| `agent-pulse tail <id>` | `tail -F` the agent's log |
+| `agent-pulse cleanup [--apply] [--older-than H]` | archive done manifests older than H hours (default 24h, dry-run by default) |
+| `agent-pulse stop` | stop the daemon(s) |
 | `agent-pulse dispatch --id --label --project [--model --kind --worktree --brief \| --cmd]` | launch + register |
 
 ## Dispatch modes
@@ -133,11 +136,57 @@ The daemon still tracks elapsed time + log growth + last line.
 
 Because two viewers — you and me (the orchestrator) — need to see the exact same state without fighting over a terminal. One daemon writes, many readers watch. If you prefer a fullscreen TUI locally, wrap `list` in your own renderer.
 
+## Drill-down
+
+```
+$ agent-pulse show w5_search
+agent: w5_search
+──────────────────────────────────────────────
+  project    DataLens
+  label      Wave 5 · search/filter endpoints
+  state      done
+  kind       codex  (gpt-5.4)
+  elapsed    1h12m
+  tokens     141,028 tokens
+  log size   1159KB
+  pid        64460
+  worktree   /tmp/DataLens_w5_search
+  brief      /tmp/w5_search_brief.md
+  log        /Users/you/.agent-pulse/w5_search.log
+
+last 20 lines
+──────────────────────────────────────────────
+... the last 20 lines of the agent's log ...
+```
+
+Pair with `agent-pulse tail w5_search` to stream the log live if it is still running.
+
+## Cleanup
+
+Archives done manifests older than a threshold so the running panel stays clean:
+
+```
+$ agent-pulse cleanup              # dry-run, 24h default
+DRY-RUN  (use --apply to actually delete)
+  • w5_search             done 3h ago
+  • w5_refresh            done 3h ago
+  • w6_audit              done 2h ago
+
+would archive: 3   would keep: 0
+
+$ agent-pulse cleanup --apply      # really move them
+archived: 3   kept: 0
+```
+
+Archived manifests move to `~/.agent-pulse/done/<id>.json`. Log files stay where they are — lightweight evidence you can still `tail` or `less`.
+
 ## Roadmap
 
 - Long-lived agent groups (blocks of siblings that should render as one row)
 - Terminal-agnostic web viewer (same live.txt rendered over HTTP)
-- History view of completed runs
+- Homebrew tap (`brew install agent-pulse`)
+- Shell completion (bash/zsh)
+- On-exit notification hook (macOS/Linux)
 - Per-project registry via `--home` flag instead of env var
 
 ## License
