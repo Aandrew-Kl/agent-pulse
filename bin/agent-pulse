@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# agent-pulse — live dashboard for long-running agent processes.
+#
+# Subcommands:
+#   agent-pulse dispatch   Launch an agent and write a registry manifest
+#   agent-pulse daemon     Background: render the live panel to a file
+#   agent-pulse watch      Foreground: loop-clear-cat the live file
+#   agent-pulse list       One-shot: print the live file and exit
+#   agent-pulse stop       Stop the daemon (pkill)
+#
+# Registry layout (default $HOME/.agent-pulse):
+#   registry/<id>.json   — one manifest per agent
+#   live.txt             — the rendered panel (daemon writes, watch reads)
+#
+# Override the registry via env:  export AGENT_PULSE_HOME=/somewhere/else
+
+set -u
+
+AGENT_PULSE_HOME="${AGENT_PULSE_HOME:-$HOME/.agent-pulse}"
+REGISTRY="$AGENT_PULSE_HOME/registry"
+LIVE_FILE="$AGENT_PULSE_HOME/live.txt"
+PID_FILE="$AGENT_PULSE_HOME/daemon.pid"
+mkdir -p "$REGISTRY"
+
+# ─── colors ────────────────────────────────────────────────────────────────
+R=$'\033[0m';  B=$'\033[1m';  D=$'\033[2m'
+RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'
+BLU=$'\033[34m'; MGN=$'\033[35m'; CYN=$'\033[36m'; WHT=$'\033[37m'
+
+fmt_elapsed() {
+  local s=$1
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm%02ds' "$((s/60))" "$((s%60))"
+  else printf '%dh%02dm' "$((s/3600))" "$(((s%3600)/60))"; fi
+}
+
+model_color() {
+  case "$1" in
+    gpt-5*|gpt5*)         printf "${BLU}" ;;
+    claude-opus*|opus*)   printf "${MGN}" ;;
+    claude-sonnet*|sonnet*)printf "${CYN}" ;;
+    claude-haiku*|haiku*) printf "${WHT}" ;;
+    *)                    printf "${YLW}" ;;
+  esac
+}
+
+kind_icon() {
+  case "$1" in
+    codex)              printf "◎" ;;
+    opus|claude-sdk)    printf "★" ;;
+    *)                  printf "◇" ;;
+  esac
+}
+
+bar() {
+  local fill=$1 width=$2 color=$3
+  local empty=$((width - fill))
+  [ "$empty" -lt 0 ] && empty=0
+  printf "${color}"
+  [ "$fill" -gt 0 ] && printf '█%.0s' $(seq 1 $fill)
+  printf "${D}"
+  [ "$empty" -gt 0 ] && printf '░%.0s' $(seq 1 $empty)
+  printf "${R}"
+}
+
+# ─── render: read registry → format → stdout ───────────────────────────────
+# render [<project_filter>]
+render() {
+  local filter="${1:-}"
+  local now=$(date '+%H:%M:%S')
+  local epoch_now=$(date +%s)
+  local running=0 done=0
+  declare -a running_manifests=()
+
+  shopt -s nullglob
+  for mf in "$REGISTRY"/*.json; do
+    # project filter
+    if [ -n "$filter" ]; then
+      local proj=$(python3 -c "import json;print(json.load(open('$mf')).get('project',''))" 2>/dev/null)
+      [ "$proj" = "$filter" ] || continue
+    fi
+    local pid pidfile
+    pid=$(python3 -c "import json;print(json.load(open('$mf')).get('pid',''))" 2>/dev/null)
+    pidfile=$(python3 -c "import json;print(json.load(open('$mf')).get('pid_file',''))" 2>/dev/null)
+    [ -z "$pid" ] && [ -f "$pidfile" ] && pid=$(cat "$pidfile")
+    if [ -n "$pid" ] && ps -p "$pid" -o pid= >/dev/null 2>&1; then
+      running=$((running + 1))
+      running_manifests+=("$mf")
+    else
+      done=$((done + 1))
+    fi
+  done
+  shopt -u nullglob
+
+  printf "${B}${MGN}╔══════════════════════════════════════════════════════════════════════════════╗${R}\n"
+  local title_suffix=""
+  [ -n "$filter" ] && title_suffix="  ·  filter: ${YLW}$filter${R}"
+  printf "${B}${MGN}║${R}  ${B}${CYN}agent-pulse${R}  ·  ${WHT}%s${R}  ·  ${GRN}● %d running${R}  ·  ${D}○ %d done${R}%s\n" "$now" "$running" "$done" "$title_suffix"
+  printf "${B}${MGN}╚══════════════════════════════════════════════════════════════════════════════╝${R}\n\n"
+
+  if [ "$running" -eq 0 ]; then
+    printf "${D}  (no running agents — idle)${R}\n\n"
+  else
+    # bash 3.2 compatible grouping: build a sorted list of "project<TAB>manifest"
+    # lines, then iterate emitting a header whenever the project changes.
+    local pairs=""
+    for mf in "${running_manifests[@]}"; do
+      local p=$(python3 -c "import json;print(json.load(open('$mf')).get('project','other'))" 2>/dev/null)
+      pairs+="$p\t$mf\n"
+    done
+    local sorted_pairs=$(printf "$pairs" | sort)
+
+    # precompute per-project counts via sort|uniq -c
+    local counts=$(printf "$pairs" | awk -F'\t' '{print $1}' | sort | uniq -c)
+
+    local prev_proj=""
+    local prev_count=""
+    while IFS=$'\t' read -r proj mf; do
+      [ -z "$proj" ] && continue
+      if [ "$proj" != "$prev_proj" ]; then
+        [ -n "$prev_proj" ] && printf "\n"
+        prev_count=$(printf "%s" "$counts" | awk -v p="$proj" '$2==p{print $1; exit}')
+        printf "${B}${CYN}▸ %s${R}  ${GRN}[%d running]${R}\n" "$proj" "$prev_count"
+        printf "${D}────────────────────────────────────────────────────────────────────────${R}\n"
+        prev_proj="$proj"
+      fi
+
+      local id=$(python3 -c "import json;print(json.load(open('$mf')).get('id',''))" 2>/dev/null)
+      local label=$(python3 -c "import json;print(json.load(open('$mf')).get('label',''))" 2>/dev/null)
+      local kind=$(python3 -c "import json;print(json.load(open('$mf')).get('kind','?'))" 2>/dev/null)
+      local model=$(python3 -c "import json;print(json.load(open('$mf')).get('model','?'))" 2>/dev/null)
+      local started=$(python3 -c "import json;print(json.load(open('$mf')).get('started_at',0))" 2>/dev/null)
+      local log=$(python3 -c "import json;print(json.load(open('$mf')).get('log_file',''))" 2>/dev/null)
+
+      local elapsed=$(fmt_elapsed $((epoch_now - started)))
+      local size_kb=0
+      [ -f "$log" ] && size_kb=$(( $(wc -c < "$log") / 1024 ))
+      local tokens=""
+      [ -f "$log" ] && tokens=$(grep -oE "tokens used [0-9,]+" "$log" 2>/dev/null | tail -1 | awk '{print $NF}')
+      [ -z "$tokens" ] && [ -f "$log" ] && tokens=$(grep -oE "tokens_used[\":=]+[0-9,]+" "$log" 2>/dev/null | tail -1 | grep -oE "[0-9,]+")
+      local last=""
+      [ -f "$log" ] && last=$(tail -1 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tr '\t' ' ' | cut -c 1-60)
+
+      local bar_fill=$(( size_kb * 25 / 3000 ))
+      [ "$bar_fill" -gt 25 ] && bar_fill=25
+      [ "$bar_fill" -lt 1 ] && bar_fill=1
+
+      local mclr=$(model_color "$model")
+      local icon=$(kind_icon "$kind")
+
+      printf "  ${GRN}●${R} ${B}%s %-22s${R}  %s%-16s${R}  ${YLW}⏱ %-7s${R}  " \
+             "$icon" "$id" "$mclr" "$model" "$elapsed"
+      if [ -n "$tokens" ]; then
+        printf "${YLW}%s tok${R}  " "$tokens"
+      else
+        printf "${D}— tok${R}      "
+      fi
+      printf "${D}%dKB${R}\n" "$size_kb"
+      printf "    ${D}%-45s${R}  " "$label"
+      bar "$bar_fill" 25 "$mclr"
+      printf "\n"
+      [ -n "$last" ] && printf "    ${D}└─ %s${R}\n" "$last"
+    done <<EOF_PAIRS
+$sorted_pairs
+EOF_PAIRS
+    printf "\n"
+  fi
+
+  printf "${D}registry: $REGISTRY  ·  stop: agent-pulse stop${R}\n"
+}
+
+# ─── daemon: loop render → live-file ───────────────────────────────────────
+# Optional --project <name> → renders ONLY that project to live-<name>.txt
+cmd_daemon() {
+  local filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) filter="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local out_file="$LIVE_FILE"
+  local pid_file="$PID_FILE"
+  if [ -n "$filter" ]; then
+    out_file="$AGENT_PULSE_HOME/live-$filter.txt"
+    pid_file="$AGENT_PULSE_HOME/daemon-$filter.pid"
+  fi
+
+  echo $$ > "$pid_file"
+  while true; do
+    render "$filter" > "$out_file.tmp" 2>/dev/null && mv "$out_file.tmp" "$out_file"
+    sleep 2
+  done
+}
+
+# ─── watch: while-loop printing the live file ─────────────────────────────
+cmd_watch() {
+  local filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) filter="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local file="$LIVE_FILE"
+  [ -n "$filter" ] && file="$AGENT_PULSE_HOME/live-$filter.txt"
+
+  while true; do
+    clear
+    if [ -f "$file" ]; then cat "$file"; else echo "no panel file: $file  —  start: agent-pulse daemon${filter:+ --project $filter} &"; fi
+    sleep 2
+  done
+}
+
+# ─── list: one-shot print ─────────────────────────────────────────────────
+cmd_list() {
+  local filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) filter="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  render "$filter"
+}
+
+# ─── stop daemon ──────────────────────────────────────────────────────────
+cmd_stop() {
+  local any=0
+  for pf in "$PID_FILE" "$AGENT_PULSE_HOME"/daemon-*.pid; do
+    [ -f "$pf" ] || continue
+    local pid=$(cat "$pf")
+    if ps -p "$pid" -o pid= >/dev/null 2>&1; then
+      kill "$pid" && echo "stopped daemon pid=$pid ($(basename "$pf"))"
+      any=1
+    fi
+    rm -f "$pf"
+  done
+  if [ "$any" = "0" ]; then
+    pkill -f 'agent-pulse daemon' 2>/dev/null && echo "killed stray daemons" || echo "no daemon running"
+  fi
+}
+
+# ─── dispatch: start an agent + write manifest ────────────────────────────
+cmd_dispatch() {
+  local id="" label="" model="gpt-5.4" project="" worktree="" brief="" kind="codex" cmd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --worktree) worktree="$2"; shift 2 ;;
+      --brief) brief="$2"; shift 2 ;;
+      --kind) kind="$2"; shift 2 ;;
+      --cmd) cmd="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; return 1 ;;
+    esac
+  done
+
+  for req in id label project; do
+    if [ -z "${!req}" ]; then echo "missing --$req" >&2; return 1; fi
+  done
+
+  local log="$AGENT_PULSE_HOME/${id}.log"
+  local pidfile="$AGENT_PULSE_HOME/${id}.pid"
+  local manifest="$REGISTRY/${id}.json"
+  local started=$(date +%s)
+
+  if [ -n "$cmd" ]; then
+    # free-form command mode (any agent kind)
+    nohup bash -c "$cmd" > "$log" 2>&1 &
+    local pid=$!
+  elif [ -n "$worktree" ] && [ -n "$brief" ]; then
+    # codex mode
+    (cd "$worktree" && nohup codex exec --full-auto -m "$model" -C "$worktree" "$(cat "$brief")" > "$log" 2>&1) &
+    local pid=$!
+  else
+    echo "provide --cmd OR (--worktree + --brief)" >&2
+    return 1
+  fi
+  echo "$pid" > "$pidfile"
+
+  python3 -c "
+import json
+json.dump({
+    'id': '$id',
+    'label': '$label',
+    'kind': '$kind',
+    'model': '$model',
+    'project': '$project',
+    'started_at': $started,
+    'pid': $pid,
+    'pid_file': '$pidfile',
+    'log_file': '$log',
+    'worktree': '$worktree',
+    'brief': '$brief'
+}, open('$manifest', 'w'), indent=2)
+"
+  echo "dispatched $id  pid=$pid  model=$model  project=$project"
+  echo "  log: $log"
+}
+
+# ─── router ───────────────────────────────────────────────────────────────
+sub="${1:-help}"
+shift || true
+case "$sub" in
+  daemon)    cmd_daemon "$@" ;;
+  watch)     cmd_watch ;;
+  list)      cmd_list ;;
+  stop)      cmd_stop ;;
+  dispatch)  cmd_dispatch "$@" ;;
+  help|--help|-h|"")
+    cat <<EOF
+agent-pulse — live dashboard for long-running agent processes.
+
+USAGE
+  agent-pulse <subcommand> [args]
+
+SUBCOMMANDS
+  daemon [--project N]   start the background renderer (optionally filtered)
+  watch [--project N]    clear+cat loop (Ctrl-C to quit)
+  list [--project N]     one-shot panel to stdout
+  stop                   stop the daemon(s)
+  dispatch --id <name> --label <text> --project <name> \\
+           [--model gpt-5.4|opus|...] [--kind codex|opus|...] \\
+           --worktree <dir> --brief <file>       # codex-style
+           # or:
+           --cmd "full command string"           # free-form
+
+REGISTRY
+  $REGISTRY
+
+EXAMPLES
+  # start the daemon + a watcher in two terminals
+  agent-pulse daemon &
+  agent-pulse watch
+
+  # launch a Codex agent for a DataLens wave task
+  agent-pulse dispatch \\
+    --id w5_search --label "search endpoints" \\
+    --model gpt-5.4 --project DataLens \\
+    --worktree /tmp/DataLens_w5_search --brief /tmp/w5_search_brief.md
+
+  # launch a custom long-running job
+  agent-pulse dispatch \\
+    --id build --label "full rebuild" --project my-app \\
+    --kind shell --model none \\
+    --cmd "cd /path/to/app && npm run build"
+EOF
+    ;;
+  *)
+    echo "unknown subcommand: $sub  (try 'agent-pulse help')" >&2
+    exit 1
+    ;;
+esac
