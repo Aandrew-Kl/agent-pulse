@@ -92,14 +92,12 @@ render() {
   done
   shopt -u nullglob
 
-  printf "${B}${MGN}╔══════════════════════════════════════════════════════════════════════════════╗${R}\n"
   local title_suffix=""
-  [ -n "$filter" ] && title_suffix="  ·  filter: ${YLW}$filter${R}"
-  printf "${B}${MGN}║${R}  ${B}${CYN}agent-pulse${R}  ·  ${WHT}%s${R}  ·  ${GRN}● %d running${R}  ·  ${D}○ %d done${R}%s\n" "$now" "$running" "$done" "$title_suffix"
-  printf "${B}${MGN}╚══════════════════════════════════════════════════════════════════════════════╝${R}\n\n"
+  [ -n "$filter" ] && title_suffix="  ${D}· $filter${R}"
+  printf "${B}${CYN}agent-pulse${R}  ${D}%s${R}   ${GRN}●%d${R}  ${D}○%d${R}%s\n\n" "$now" "$running" "$done" "$title_suffix"
 
   if [ "$running" -eq 0 ]; then
-    printf "${D}  (no running agents — idle)${R}\n\n"
+    printf "${D}  idle${R}\n"
   else
     # bash 3.2 compatible grouping: build a sorted list of "project<TAB>manifest"
     # lines, then iterate emitting a header whenever the project changes.
@@ -120,14 +118,11 @@ render() {
       if [ "$proj" != "$prev_proj" ]; then
         [ -n "$prev_proj" ] && printf "\n"
         prev_count=$(printf "%s" "$counts" | awk -v p="$proj" '$2==p{print $1; exit}')
-        printf "${B}${CYN}▸ %s${R}  ${GRN}[%d running]${R}\n" "$proj" "$prev_count"
-        printf "${D}────────────────────────────────────────────────────────────────────────${R}\n"
+        printf "${B}${CYN}▸ %s${R}  ${D}(%d)${R}\n" "$proj" "$prev_count"
         prev_proj="$proj"
       fi
 
       local id=$(python3 -c "import json;print(json.load(open('$mf')).get('id',''))" 2>/dev/null)
-      local label=$(python3 -c "import json;print(json.load(open('$mf')).get('label',''))" 2>/dev/null)
-      local kind=$(python3 -c "import json;print(json.load(open('$mf')).get('kind','?'))" 2>/dev/null)
       local model=$(python3 -c "import json;print(json.load(open('$mf')).get('model','?'))" 2>/dev/null)
       local started=$(python3 -c "import json;print(json.load(open('$mf')).get('started_at',0))" 2>/dev/null)
       local log=$(python3 -c "import json;print(json.load(open('$mf')).get('log_file',''))" 2>/dev/null)
@@ -137,36 +132,28 @@ render() {
       [ -f "$log" ] && size_kb=$(( $(wc -c < "$log") / 1024 ))
       local tokens=""
       [ -f "$log" ] && tokens=$(grep -oE "tokens used [0-9,]+" "$log" 2>/dev/null | tail -1 | awk '{print $NF}')
-      [ -z "$tokens" ] && [ -f "$log" ] && tokens=$(grep -oE "tokens_used[\":=]+[0-9,]+" "$log" 2>/dev/null | tail -1 | grep -oE "[0-9,]+")
-      local last=""
-      [ -f "$log" ] && last=$(tail -1 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tr '\t' ' ' | cut -c 1-60)
 
-      local bar_fill=$(( size_kb * 25 / 3000 ))
-      [ "$bar_fill" -gt 25 ] && bar_fill=25
+      local bar_fill=$(( size_kb * 12 / 3000 ))
+      [ "$bar_fill" -gt 12 ] && bar_fill=12
       [ "$bar_fill" -lt 1 ] && bar_fill=1
 
       local mclr=$(model_color "$model")
-      local icon=$(kind_icon "$kind")
 
-      printf "  ${GRN}●${R} ${B}%s %-22s${R}  %s%-16s${R}  ${YLW}⏱ %-7s${R}  " \
-             "$icon" "$id" "$mclr" "$model" "$elapsed"
+      # one line per agent: dot | id | model | elapsed | [bar] | tokens
+      printf "  ${GRN}●${R} ${B}%-16s${R}  %s%-10s${R}  ${WHT}%-7s${R}  " \
+             "$id" "$mclr" "$model" "$elapsed"
+      bar "$bar_fill" 12 "$mclr"
       if [ -n "$tokens" ]; then
-        printf "${YLW}%s tok${R}  " "$tokens"
+        printf "  ${D}%s tok${R}\n" "$tokens"
       else
-        printf "${D}— tok${R}      "
+        printf "\n"
       fi
-      printf "${D}%dKB${R}\n" "$size_kb"
-      printf "    ${D}%-45s${R}  " "$label"
-      bar "$bar_fill" 25 "$mclr"
-      printf "\n"
-      [ -n "$last" ] && printf "    ${D}└─ %s${R}\n" "$last"
     done <<EOF_PAIRS
 $sorted_pairs
 EOF_PAIRS
     printf "\n"
   fi
 
-  printf "${D}registry: $REGISTRY  ·  stop: agent-pulse stop${R}\n"
 }
 
 # ─── daemon: loop render → live-file ───────────────────────────────────────
